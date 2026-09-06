@@ -1,4 +1,5 @@
 /.lake/
 /zkl/
+test/fixtures/*/.lake/
 __pycache__/
 *.pyc

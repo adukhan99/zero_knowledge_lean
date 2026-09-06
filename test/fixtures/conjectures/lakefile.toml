@@ -1,0 +1,5 @@
+name = "conjectures"
+defaultTargets = ["Conjectures"]
+
+[[lean_lib]]
+name = "Conjectures"

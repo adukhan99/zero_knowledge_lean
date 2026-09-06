@@ -119,6 +119,7 @@ def ppForDisplay (env : Environment) (levelParams : List Name) (e : Expr) : IO S
   return "{" ++ String.intercalate " " (levelParams.map toString) ++ "} " ++ body
 
 structure Report where
+  standalone : Bool
   target     : Name
   statement  : String
   axioms     : Array Name
@@ -136,7 +137,12 @@ def checkArtifact (a : Artifact) (allowed : Array Name) : IO Report := do
     throw <| IO.userError
       s!"commitment mismatch: artifact claims root {a.root} but its declarations hash to {recomputed}"
 
-  let baseEnv <- importModules (a.imports.map fun m => { module := m }) {} (trustLevel := 0)
+  -- An empty import list means a standalone witness: everything it needs is in
+  -- the file, and it is checked against a literally empty environment. That is
+  -- the property any zero-knowledge backend depends on, since a prover running
+  -- in a circuit or a zkVM cannot open `.olean` files.
+  let baseEnv <- if a.imports.isEmpty then mkEmptyEnvironment
+                 else importModules (a.imports.map fun m => { module := m }) {} (trustLevel := 0)
   for c in a.constants do
     if (findConst? baseEnv c.name).isSome then
       throw <| IO.userError s!"artifact redefines an imported constant: {c.name}"
@@ -158,7 +164,8 @@ def checkArtifact (a : Artifact) (allowed : Array Name) : IO Report := do
 
   let axs := axiomsUsed env a.target
   let extra := axs.filter fun n => !allowed.contains n
-  return { target := a.target, statement := <- ppForDisplay env ci.levelParams ci.type,
+  return { standalone := a.imports.isEmpty, target := a.target,
+           statement := <- ppForDisplay env ci.levelParams ci.type,
            axioms := axs,
            extraAxioms := extra, declCount := a.constants.size, rootOk := true,
            root := a.root }

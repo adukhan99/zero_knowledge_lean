@@ -114,6 +114,15 @@ def opaqueName (salt : String) (n : Name) : Name :=
 structure SealOpts where
   /-- Obfuscate the target's statement as well as its proof. -/
   hideStatement : Bool := false
+  /-- Carry the *entire* transitive closure, down to `Nat` and `Eq`, so the
+  artifact can be checked against an empty environment with no Lean
+  installation at all.
+
+  This is what any zero-knowledge backend needs: a prover running inside a
+  circuit or a zkVM gets a byte array and cannot open `.olean` files. It is
+  also why standalone artifacts do not obfuscate imported names -- see
+  `mayRename` in `sealDecl`. -/
+  standalone : Bool := false
   /-- Keys the name mangling. A fresh random salt makes the mangling
   non-invertible; a fixed salt makes sealing reproducible. -/
   salt : String
@@ -148,7 +157,8 @@ whose parent was renamed inherits that parent's new prefix.
 A name in `publicSet` keeps its own name -- but only if its parent did too,
 which always holds, since anything the target's type mentions has its parents
 in the type's closure as well. -/
-def buildRenameMap (salt : String) (closure publicSet : NameSet) (isRecursor : Name -> Bool) :
+def buildRenameMap (salt : String) (closure publicSet : NameSet)
+    (isRecursor : Name -> Bool) (mayRename : Name -> Bool) :
     Res (Std.HashMap Name Name) := do
   let ordered := closure.toArray.qsort fun a b =>
     let da := nameDepth a
@@ -167,7 +177,13 @@ def buildRenameMap (salt : String) (closure publicSet : NameSet) (isRecursor : N
                     | none => none
       | .anonymous => none
     let r :=
-      if isRecursor n then
+      if !mayRename n then
+        -- Imported constants keep their names. Some are privileged by the
+        -- kernel (`Nat` and friends back literal arithmetic), the three
+        -- standard axioms must stay recognisable to the audit, and none of
+        -- them is yours to hide anyway.
+        n
+      else if isRecursor n then
         -- The kernel derives this name itself when it replays the inductive,
         -- so it must track the inductive's name whether or not that changed.
         match n with
@@ -188,15 +204,20 @@ of the sealed development and is therefore exported (and possibly renamed);
 constants present in `base` are left alone and reached through `imports`. -/
 def sealDecl (env base : Environment) (target : Name) (imports : Array Name) (o : SealOpts) :
     Res Sealed := do
-  let isLocal := fun n => (findConst? base n).isNone
+  -- Two separate questions. `inClosure`: does this constant travel with the
+  -- artifact, or is it reached through an import? `mayRename`: is it ours to
+  -- obfuscate? Standalone sealing widens the first without touching the second.
+  let mayRename := fun n => (findConst? base n).isNone
+  let inClosure := if o.standalone then (fun _ => true) else mayRename
   let some ci := findConst? env target | throw s!"no such declaration: {target}"
-  let closure := localClosure env isLocal #[target]
+  let closure := localClosure env inClosure #[target]
   -- The claim is the target's *type*, not its name: the name is obfuscated
   -- like any other, while the definitions the type mentions stay readable.
   let publicSet : NameSet :=
-    if o.hideStatement then {} else localClosure env isLocal ci.type.getUsedConstants
-  let renameMap <- buildRenameMap o.salt closure publicSet fun n =>
-    match findConst? env n with | some (.recInfo _) => true | _ => false
+    if o.hideStatement then {} else localClosure env inClosure ci.type.getUsedConstants
+  let renameMap <- buildRenameMap o.salt closure publicSet
+    (fun n => match findConst? env n with | some (.recInfo _) => true | _ => false)
+    mayRename
   let rename := fun (n : Name) => renameMap.getD n n
   let scrubbedTarget := scrubConst rename ci
   let mut out : Array (Name × Json) := #[]

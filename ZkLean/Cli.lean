@@ -4,8 +4,9 @@ The `zklean` command line.
     zklean seal   MODULE [DECL ...]   seal declarations into obfuscated artifacts
     zklean check  ARTIFACT ...        re-check artifacts with the Lean kernel
     zklean commit MODULE ...          seal everything and commit it to one Merkle root
+    zklean export ARTIFACT           re-emit as Lean's NDJSON export format
 -/
-import ZkLean.Check
+import ZkLean.Export
 
 namespace ZkLean
 open Lean
@@ -17,12 +18,18 @@ USAGE
   zklean seal   MODULE [DECL ...]   seal declarations (default: every theorem in MODULE)
   zklean check  ARTIFACT ...        re-check artifacts with the Lean kernel
   zklean commit MODULE ...          seal everything and commit it to one Merkle root
+  zklean export ARTIFACT           re-emit a checked artifact as Lean NDJSON export
+                                   format, for independent checkers
+  zklean SRC DST                    seal a whole repository into a standalone,
+                                   obfuscated one (alias: seal-repo SRC DST)
 
 OPTIONS
   -o, --out DIR            output directory (default: zkl)
       --salt S             fixed salt; reproducible but invertible by anyone who
                            knows S. Default: fresh random salt, printed once.
       --hide-statement     obfuscate the target's statement as well as its proof
+      --standalone         carry the whole closure down to `Nat`, so the artifact
+                           checks against an empty environment with no Lean install
       --include M1,M2      also treat these modules as part of the sealed development
       --allow-axioms A,B   extra axioms `check` will tolerate (default: the three
                            standard ones -- propext, Classical.choice, Quot.sound)
@@ -34,6 +41,7 @@ structure Opts where
   outDir        : System.FilePath := "zkl"
   salt          : Option String := none
   hideStatement : Bool := false
+  standalone    : Bool := false
   include?      : Array Name := #[]
   allowAxioms   : Array Name := standardAxioms
 
@@ -61,6 +69,7 @@ partial def parseOpts (args : List String) (o : Opts := {}) (pos : Array String 
   | "-o" :: v :: rest | "--out" :: v :: rest => parseOpts rest { o with outDir := v } pos
   | "--salt" :: v :: rest => parseOpts rest { o with salt := some v } pos
   | "--hide-statement" :: rest => parseOpts rest { o with hideStatement := true } pos
+  | "--standalone" :: rest => parseOpts rest { o with standalone := true } pos
   | "--include" :: v :: rest => parseOpts rest { o with include? := splitNames v } pos
   | "--allow-axioms" :: v :: rest =>
       parseOpts rest { o with allowAxioms := standardAxioms ++ splitNames v } pos
@@ -135,7 +144,8 @@ text written (which is what a transcript commits to). -/
 def sealOne (env base : Environment) (imports : Array Name) (target : Name) (o : Opts)
     (salt : String) : IO (System.FilePath × String × Sealed) := do
   let s <- IO.ofExcept <|
-    sealDecl env base target imports { salt, hideStatement := o.hideStatement }
+    sealDecl env base target (if o.standalone then #[] else imports)
+      { salt, hideStatement := o.hideStatement, standalone := o.standalone }
   let path := o.outDir / s!"{s.target}.zkl.json"
   let text <- writeJson path s.toJson
   warnAxioms target s
@@ -184,7 +194,8 @@ def reportOne (path : System.FilePath) (allowed : Array Name) : IO Bool := do
     IO.println s!"{if ok then "VALID   " else "REJECTED"} {path}"
     IO.println s!"  target      : {r.target}"
     IO.println s!"  statement   : {r.statement}"
-    IO.println s!"  declarations: {r.declCount} (all accepted by the kernel)"
+    let scope := if r.standalone then "standalone" else "plus imports"
+    IO.println s!"  declarations: {r.declCount} ({scope}; all accepted by the kernel)"
     IO.println s!"  root        : {r.root}"
     IO.println s!"  axioms      : {if r.axioms.isEmpty then "none" else names r.axioms}"
     unless ok do
@@ -247,6 +258,143 @@ def cmdCommit (o : Opts) (pos : Array String) : IO UInt32 := do
   IO.println s!"transcript  : {tpath}"
   return 0
 
+/-- Re-emit an artifact in Lean's official NDJSON export format.
+
+The artifact is replayed through the kernel first, so what gets written is
+exactly what the kernel accepted -- including the recursors it derived, which a
+sealed artifact does not carry. -/
+def cmdExport (o : Opts) (pos : Array String) : IO UInt32 := do
+  let some (path : String) := pos[0]? | throw (IO.userError s!"export: expected an artifact path\n\n{usage}")
+  Lean.initSearchPath (<- Lean.findSysroot)
+  let j <- IO.ofExcept (Json.parse (<- IO.FS.readFile path))
+  let a <- IO.ofExcept (parseArtifact j)
+  let r <- checkArtifact a o.allowAxioms
+  unless r.extraAxioms.isEmpty do
+    let names := String.intercalate ", " (r.extraAxioms.toList.map toString)
+    throw (IO.userError s!"export: refusing {path}; it depends on {names}")
+  let baseEnv <- if a.imports.isEmpty then mkEmptyEnvironment
+                 else importModules (a.imports.map fun m => { module := m }) {} (trustLevel := 0)
+  let env <- Environment.replay
+    (Std.HashMap.ofList (a.constants.toList.map fun c => (c.name, c))) baseEnv
+  let text := exportNdjson env #[a.target]
+  let out := o.outDir / s!"{a.target}.ndjson"
+  if let some d := out.parent then IO.FS.createDirAll d
+  IO.FS.writeFile out text
+  IO.println s!"target      : {a.target}"
+  IO.println s!"standalone  : {r.standalone}"
+  let lineCount := (text.splitOn "\n").length - 1
+  IO.println s!"lines       : {lineCount}"
+  IO.println s!"export      : {out}"
+  return 0
+
+/-- The Lake package root at or above `p`: the nearest directory holding a
+`lakefile.toml` or `lakefile.lean`. Module names are relative to this, not to
+whatever subdirectory the user pointed at, so `zklean ZkLean out` still yields
+`ZkLean.Check` rather than `Check`. -/
+partial def packageRoot (p : System.FilePath) : IO System.FilePath := do
+  let cur <- IO.FS.realPath p
+  let rec up (d : System.FilePath) (fuel : Nat) : IO System.FilePath := do
+    match fuel with
+    | 0 => return cur
+    | fuel + 1 =>
+      if (<- (d / "lakefile.toml").pathExists) || (<- (d / "lakefile.lean").pathExists) then
+        return d
+      match d.parent with
+      | some par => if par == d then return cur else up par fuel
+      | none => return cur
+  up (if (<- cur.isDir) then cur else cur.parent.getD cur) 64
+
+/-- Every `.lean` file under `dir`, as module names relative to `root`. Skips
+build and VCS directories. -/
+partial def discoverModules (root dir : System.FilePath) : IO (Array Name) := do
+  let skip := [".lake", ".git", "build", "lake-packages", "node_modules"]
+  let rootStr := (<- IO.FS.realPath root).toString
+  let rec go (p : System.FilePath) : IO (Array Name) := do
+    let mut acc : Array Name := #[]
+    for e in (<- p.readDir) do
+      let base := e.fileName
+      if base.startsWith "." || skip.contains base then continue
+      if (<- e.path.isDir) then
+        acc := acc ++ (<- go e.path)
+      else if base.endsWith ".lean" then
+        let full := (<- IO.FS.realPath e.path).toString
+        if full.startsWith rootStr then
+          let rel := ((full.drop (rootStr.length + 1)).toString.dropEnd 5).toString
+          let parts := (rel.splitOn "/").filter (fun c => !c.isEmpty)
+          unless parts.isEmpty do
+            acc := acc.push (parts.foldl (fun n c => Name.str n c) Name.anonymous)
+    return acc
+  let mods <- go (<- IO.FS.realPath dir)
+  return mods.qsort (fun a b => a.toString < b.toString)
+
+/-- `zklean SRC DST`: turn a Lean repository into a self-contained,
+kernel-checkable, obfuscated one.
+
+This is the headline operation, and it is one-way by construction: the output
+holds elaborated proof terms with every name the development introduced
+replaced by a salt-keyed digest, and the salt is discarded unless you asked for
+a fixed one. Nothing in `DST` can reconstruct `SRC`.
+
+Run it under the *source* repository's `lake env` so its modules are on the
+search path:
+
+    lake env /path/to/zklean . ../zk-repo
+-/
+def cmdSealRepo (o : Opts) (src dst : System.FilePath) : IO UInt32 := do
+  let root <- packageRoot src
+  let mods <- discoverModules root src
+  if mods.isEmpty then
+    IO.eprintln s!"no .lean files under {src}"
+    return 1
+  IO.println s!"source      : {src}  ({mods.size} modules, package root {root})"
+  let (env, base, _) <- loadEnvs mods o.include?
+  let targets := localTheorems env base
+  if targets.isEmpty then
+    IO.eprintln "no theorems found; is the source repository built?"
+    return 1
+  let salt <- match o.salt with | some s => pure s | none => freshSalt
+  let saltNote := if o.salt.isSome then "fixed (reproducible, and invertible by anyone holding it)"
+                  else "random, and discarded -- the mapping is not recoverable"
+  -- Everything is sealed standalone: the output must not need a Lean install.
+  let opts := { o with standalone := true, outDir := dst }
+  let mut entries : Array (String × String) := #[]
+  let mut sealedCount := 0
+  let mut refused : Array Name := #[]
+  for t in targets do
+    try
+      let (_, text, sealed) <- sealOne env base #[] t opts salt
+      entries := entries.push (s!"thm:{sealed.target}", text)
+      sealedCount := sealedCount + 1
+    catch e =>
+      refused := refused.push t
+      IO.eprintln s!"skipped {t}: {e}"
+  let (root, sorted, proofs) := commit entries
+  let leaves := (Array.range sorted.size).map fun i =>
+    let (id, content) := sorted[i]!
+    Json.mkObj [
+      ("id", Json.str id),
+      ("content_hash", Json.str (toHex (leafHash content))),
+      ("artifact", Json.str ((id.drop 4).toString ++ ".zkl.json")),
+      ("proof", Json.arr (proofs[i]!.map fun st =>
+        Json.mkObj [("sibling", Json.str (toHex st.sibling)), ("left", Json.bool st.left)]))]
+  let transcript := Json.mkObj [
+    ("format", Json.str "zklean/v2"),
+    ("hash", Json.str "sha256"),
+    ("standalone", Json.bool true),
+    ("domain_separation", Json.mkObj [
+      ("leaf", Json.str "SHA256(0x00 || utf8(content))"),
+      ("node", Json.str "SHA256(0x01 || left || right)"),
+      ("empty", Json.str "SHA256(0x00)")]),
+    ("root", Json.str (toHex root)),
+    ("leaf_count", Json.num (JsonNumber.fromNat sorted.size)),
+    ("leaves", Json.arr leaves)]
+  let _ <- writeJson (dst / "transcript.json") transcript
+  IO.println s!"theorems    : {sealedCount} sealed{if refused.isEmpty then "" else s!", {refused.size} skipped"}"
+  IO.println s!"salt        : {saltNote}"
+  IO.println s!"merkle root : {toHex root}"
+  IO.println s!"output      : {dst}"
+  return if sealedCount == 0 then 1 else 0
+
 def run (argv : List String) : IO UInt32 := do
   match argv with
   | [] | ["--help"] | ["-h"] => IO.println usage; return 0
@@ -256,6 +404,17 @@ def run (argv : List String) : IO UInt32 := do
     | "seal" => cmdSeal o pos
     | "check" => cmdCheck o pos
     | "commit" => cmdCommit o pos
-    | _ => IO.eprintln s!"unknown command: {cmd}\n\n{usage}"; return 1
+    | "export" => cmdExport o pos
+    | "seal-repo" =>
+      match (pos[0]? : Option String), (pos[1]? : Option String) with
+      | some a, some b => cmdSealRepo o a b
+      | _, _ => IO.eprintln s!"seal-repo: expected SRC and DST\n\n{usage}"; return 1
+    | _ =>
+      -- `zklean SRC DST` is the headline form; treat it as `seal-repo`.
+      if (<- (cmd : System.FilePath).isDir) && pos.size == 1 then
+        cmdSealRepo o cmd pos[0]!
+      else
+        IO.eprintln s!"unknown command: {cmd}\n\n{usage}"
+        return 1
 
 end ZkLean

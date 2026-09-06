@@ -56,15 +56,123 @@ def check(name: str, cond: bool, detail: str = "", fatal: bool = False) -> None:
         raise Fatal(name)
 
 
-def run(*args: str, expect: int | None = None) -> subprocess.CompletedProcess:
+def lake_env() -> dict:
     env = dict(os.environ)
     if TOOLCHAIN_LIB.is_dir():
         env["LD_LIBRARY_PATH"] = f"{TOOLCHAIN_LIB}:{env.get('LD_LIBRARY_PATH', '')}"
+    return env
+
+
+def run(*args: str, expect: int | None = None) -> subprocess.CompletedProcess:
     p = subprocess.run(["lake", "env", *args], cwd=ROOT, capture_output=True,
-                       text=True, env=env)
+                       text=True, env=lake_env())
     if expect is not None and p.returncode != expect:
         print(f"  (exit {p.returncode}, expected {expect})")
     return p
+
+
+def validate_ndjson(path: Path) -> list[str]:
+    """Structural check of an NDJSON export: every index defined before use,
+    every reference resolving, no unknown tags.
+
+    This is what catches the interning bugs -- a dangling index, or a primitive
+    emitted after the declaration that refers to it -- without needing a kernel.
+    """
+    errs: list[str] = []
+    names, levels, exprs = {0}, {0}, set()
+
+    def ref(kind: str, rs, ln: int, table, tname: str) -> None:
+        for r in rs:
+            if r not in table:
+                errs.append(f"line {ln}: {kind} refers to unknown {tname} {r}")
+
+    lines = [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+    if not lines or "meta" not in lines[0]:
+        errs.append("missing meta line")
+    for i, o in enumerate(lines, 1):
+        if "meta" in o:
+            continue
+        if "in" in o:
+            ref("name", [(o.get("str") or o["num"])["pre"]], i, names, "name")
+            names.add(o["in"])
+        elif "il" in o:
+            rs = [o[k] for k in ("succ",) if k in o]
+            for k in ("max", "imax"):
+                rs += o.get(k, [])
+            ref("level", rs, i, levels, "level")
+            if "param" in o:
+                ref("level", [o["param"]], i, names, "name")
+            levels.add(o["il"])
+        elif "ie" in o:
+            n, l, e = [], [], []
+            for k, v in o.items():
+                if k == "ie" or k in ("bvar", "natVal", "strVal"):
+                    continue
+                if k == "sort":
+                    l.append(v)
+                elif k == "const":
+                    n.append(v["name"]); l += v["us"]
+                elif k == "app":
+                    e += [v["fn"], v["arg"]]
+                elif k in ("lam", "forallE"):
+                    n.append(v["name"]); e += [v["type"], v["body"]]
+                elif k == "letE":
+                    n.append(v["name"]); e += [v["type"], v["value"], v["body"]]
+                elif k == "proj":
+                    n.append(v["typeName"]); e.append(v["struct"])
+                else:
+                    errs.append(f"line {i}: unknown expression tag {k!r}")
+            ref("expr", n, i, names, "name")
+            ref("expr", l, i, levels, "level")
+            ref("expr", e, i, exprs, "expr")
+            exprs.add(o["ie"])
+        else:
+            (kind, body), = o.items()
+
+            def cv(b):
+                ref(kind, [b["name"]] + b["levelParams"], i, names, "name")
+                ref(kind, [b["type"]], i, exprs, "expr")
+
+            if kind == "inductive":
+                for t in body["types"]:
+                    cv(t)
+                for c in body["ctors"]:
+                    cv(c); ref(kind, [c["induct"]], i, names, "name")
+                for r in body["recs"]:
+                    cv(r)
+                    for rule in r["rules"]:
+                        ref(kind, [rule["ctor"]], i, names, "name")
+                        ref(kind, [rule["rhs"]], i, exprs, "expr")
+            elif kind in ("axiom", "def", "thm", "opaque", "quot"):
+                cv(body)
+                if "value" in body:
+                    ref(kind, [body["value"]], i, exprs, "expr")
+            else:
+                errs.append(f"line {i}: unknown declaration kind {kind!r}")
+    return errs
+
+
+def nanoda() -> str | None:
+    """An independent Lean kernel, if one is available.
+
+    Set ZKLEAN_NANODA to a `nanoda_bin` built from
+    https://github.com/ammkrn/nanoda_lib to enable the cross-check.
+    """
+    return os.environ.get("ZKLEAN_NANODA") or shutil.which("nanoda_bin")
+
+
+def nanoda_says(binary: str, ndjson: Path, tmp: Path, axioms: list[str]) -> str:
+    cfg = tmp / "nanoda-config.json"
+    cfg.write_text(json.dumps({
+        "export_file_path": str(ndjson),
+        "permitted_axioms": axioms,
+        "unpermitted_axiom_hard_error": True,
+        "nat_extension": True,
+        "string_extension": True,
+        "print_success_message": True,
+    }))
+    p = subprocess.run([binary, str(cfg)], capture_output=True, text=True)
+    return (p.stdout + p.stderr).strip()
 
 
 def verdicts(out: str) -> dict[str, str]:
@@ -236,6 +344,72 @@ def main() -> int:
         check("a different salt gives a different root", r1 != r3, f"{r1}\n{r3}")
 
         # ---------------------------------------------------------------
+        # Standalone witnesses: self-contained, checkable with no Lean at all.
+        # ---------------------------------------------------------------
+        sa = tmp / "standalone"
+        p = run(str(ZKLEAN), "seal", "ZkLean.Demo", "ZkLean.Demo.sum_mirror",
+                "ZkLean.Demo.zero_add_self", "--salt", "t", "--standalone",
+                "-o", str(sa), expect=0)
+        check("standalone sealing succeeds", p.returncode == 0, p.stdout + p.stderr)
+        sa_files = sorted(sa.glob("*.zkl.json"))
+        for f in sa_files:
+            a = json.loads(f.read_text())
+            check(f"{f.name[:14]}… declares no imports", a["imports"] == [], str(a["imports"]))
+        p = run(str(ZKLEAN), "check", *map(str, sa_files), expect=0)
+        check("standalone artifacts verify against an empty environment",
+              p.returncode == 0 and set(verdicts(p.stdout).values()) == {"VALID"},
+              p.stdout + p.stderr)
+        check("check reports them as standalone", "standalone;" in p.stdout, p.stdout[:400])
+
+        # ---------------------------------------------------------------
+        # Export to the standard interchange format.
+        # ---------------------------------------------------------------
+        nd = tmp / "ndjson"
+        for f in sa_files:
+            run(str(ZKLEAN), "export", str(f), "-o", str(nd))
+        nds = sorted(nd.glob("*.ndjson"))
+        check("export produces one file per artifact", len(nds) == len(sa_files),
+              f"{len(nds)} vs {len(sa_files)}")
+        for f in nds:
+            errs = validate_ndjson(f)
+            check(f"{f.name[:14]}… is structurally valid NDJSON", not errs,
+                  "\n".join(errs[:6]))
+
+        # `export` must refuse what `check` would reject.
+        adv_sa = tmp / "adv-standalone"
+        run(str(ZKLEAN), "seal", "ZkLeanTests.Adversarial", "--salt", "t",
+            "--standalone", "-o", str(adv_sa))
+        bad_exports = 0
+        for f in sorted(adv_sa.glob("*.zkl.json")):
+            if run(str(ZKLEAN), "export", str(f), "-o", tmp / "adv-nd").returncode != 0:
+                bad_exports += 1
+        check("export refuses artifacts the audit rejects", bad_exports == 2,
+              f"{bad_exports} refused, expected 2")
+
+        # ---------------------------------------------------------------
+        # Cross-check with an independent kernel, when one is available.
+        # ---------------------------------------------------------------
+        nb = nanoda()
+        if nb:
+            std = ["Quot.sound", "Classical.choice", "propext"]
+            for f in nds:
+                out_s = nanoda_says(nb, f, tmp, std)
+                check(f"independent kernel accepts {f.name[:14]}…",
+                      "no typechecker errors" in out_s, out_s[:300])
+            # And it must reject `sorry` on its own terms, not just because we do.
+            sorry_nd = tmp / "adv-nd-sorry"
+            for f in sorted(adv_sa.glob("*.zkl.json")):
+                run(str(ZKLEAN), "export", str(f), "-o", str(sorry_nd),
+                    "--allow-axioms", "sorryAx")
+            got = [nanoda_says(nb, f, tmp, std) for f in sorted(sorry_nd.glob("*.ndjson"))]
+            check("independent kernel rejects the sorry artifact",
+                  any("unpermitted axiom" in g and "sorryAx" in g for g in got),
+                  "\n".join(g[:150] for g in got))
+        else:
+            print("skip independent-kernel cross-check "
+                  "(set ZKLEAN_NANODA to a nanoda_bin binary to enable)")
+
+        # ---------------------------------------------------------------
         # --include moves the boundary of "the sealed development".
         # ---------------------------------------------------------------
         TGT = "ZkLean.Demo.scale_one_eq"      # its proof reaches into ZkLean.DemoAux
@@ -286,6 +460,61 @@ def main() -> int:
                   p.returncode == 0 and "VALID" in p.stdout, p.stdout + p.stderr)
             check("hidden-statement artifact leaks no names",
                   "Tree" not in hf[0].read_text(), hf[0].read_text()[:300])
+
+        # ---------------------------------------------------------------
+        # The headline operation, on a separate package: a whole Lean repo in,
+        # a standalone obfuscated repo out.
+        # ---------------------------------------------------------------
+        fixture = ROOT / "test" / "fixtures" / "conjectures"
+        b = subprocess.run(["lake", "build"], cwd=fixture, capture_output=True,
+                           text=True, env=lake_env())
+        check("fixture repository builds", b.returncode == 0,
+              (b.stdout + b.stderr)[-800:], fatal=False)
+        if b.returncode == 0:
+            zkout = tmp / "zk-conjectures"
+            # Run under the *fixture's* lake env: sealing a repository needs
+            # that repository's modules on the search path.
+            r = subprocess.run(["lake", "env", str(ZKLEAN), ".", str(zkout)],
+                               cwd=fixture, capture_output=True, text=True,
+                               env=lake_env())
+            check("seal-repo succeeds", r.returncode == 0, r.stdout + r.stderr)
+            check("seal-repo reports a discarded salt",
+                  "discarded" in r.stdout, r.stdout)
+            arts = sorted(zkout.glob("*.zkl.json"))
+            check("seal-repo sealed both theorems", len(arts) == 2,
+                  f"{len(arts)} artifacts")
+            check("seal-repo wrote a transcript", (zkout / "transcript.json").exists())
+
+            # One-way: the theorem and module names must not survive. The
+            # statement's own vocabulary does, and must -- an attestation to an
+            # unreadable claim attests to nothing.
+            blob = "".join(f.read_text() for f in arts)
+            for gone in ("all_reach_32", "step_double", "Collatz"):
+                check(f"seal-repo hides {gone}", gone not in blob)
+            # Names are encoded componentwise (["Conjectures","step"]), so
+            # look for the components rather than a dotted string.
+            check("seal-repo keeps the statement's vocabulary",
+                  '"AllReach"' in blob and '"step"' in blob and '"Conjectures"' in blob)
+
+            p = run(str(ZKLEAN), "check", *map(str, arts), expect=0)
+            check("sealed repository verifies against an empty environment",
+                  p.returncode == 0 and set(verdicts(p.stdout).values()) == {"VALID"},
+                  p.stdout + p.stderr)
+            check("the conjecture's statement is legible in the report",
+                  "Conjectures.AllReach 32 128" in p.stdout, p.stdout[:600])
+
+            if nb:
+                ndd = tmp / "zk-nd"
+                for f in arts:
+                    run(str(ZKLEAN), "export", str(f), "-o", str(ndd))
+                for f in sorted(ndd.glob("*.ndjson")):
+                    errs = validate_ndjson(f)
+                    check(f"repo export {f.name[:12]}… is structurally valid", not errs,
+                          "\n".join(errs[:4]))
+                    out_s = nanoda_says(nb, f, tmp,
+                                        ["Quot.sound", "Classical.choice", "propext"])
+                    check(f"independent kernel accepts repo export {f.name[:12]}…",
+                          "no typechecker errors" in out_s, out_s[:300])
 
     except Fatal as e:
         print(f"\naborted: {e} failed, so the remaining checks were skipped")

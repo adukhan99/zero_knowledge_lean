@@ -22,6 +22,16 @@ abbrev Res := Except String
 
 private def tag (t : String) (args : Array Json) : Json := Json.arr (#[Json.str t] ++ args)
 
+/-- The only names a `quotInfo` declaration may carry.
+
+`Environment.replay` handles any quotient declaration by discarding it and
+installing the kernel's own quotient module. Restricting the name keeps an
+artifact from using that path to claim it has declared something it has not:
+without this, `quotInfo` named `myFalse : False` would be silently accepted as
+"declared" and then found missing by whatever referenced it -- a confusing error
+instead of a clear one. -/
+def quotNames : Array Name := #[``Quot, ``Quot.mk, ``Quot.lift, ``Quot.ind]
+
 private def nat (n : Nat) : Json := Json.str (toString n)
 
 private def getNat (j : Json) : Res Nat := do
@@ -224,6 +234,16 @@ def constOfJson (j : Json) : Res ConstantInfo := do
   | "ct" =>
     let induct ← nm 4; let cidx ← n 5; let numParams ← n 6; let numFields ← n 7
     return .ctorInfo { toConstantVal := cv, induct, cidx, numParams, numFields, isUnsafe := false }
+  | "qt" =>
+    let kind <- match <- n 4 with
+      | 0 => pure QuotKind.type
+      | 1 => pure .ctor
+      | 2 => pure .lift
+      | 3 => pure .ind
+      | k => throw s!"wire: bad quotient kind {k}"
+    unless quotNames.contains cv.name do
+      throw s!"wire: {cv.name} is not a quotient constant"
+    return .quotInfo { toConstantVal := cv, kind }
   | "rc" =>
     let all ← ns 4; let numParams ← n 5; let numIndices ← n 6
     let numMotives ← n 7; let numMinors ← n 8; let k ← b 10
@@ -233,14 +253,6 @@ def constOfJson (j : Json) : Res ConstantInfo := do
       let rhs ← exprOfJson (← field r 2)
       return ({ ctor, nfields, rhs } : RecursorRule)
     return .recInfo { toConstantVal := cv, all, numParams, numIndices, numMotives, numMinors, rules := rules.toList, k, isUnsafe := false }
-  | "qt" =>
-    let kind ← match ← n 4 with
-      | 0 => pure QuotKind.type
-      | 1 => pure .ctor
-      | 2 => pure .lift
-      | 3 => pure .ind
-      | k => throw s!"wire: bad quotient kind {k}"
-    return .quotInfo { toConstantVal := cv, kind }
   | t => throw s!"wire: unknown constant tag {t}"
 
 /-- The canonical bytes a constant is committed to: its JSON encoding, compacted. -/

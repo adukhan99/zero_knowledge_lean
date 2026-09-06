@@ -18,8 +18,19 @@ jobs:
         with:
           build-args: "zklean zklean-tamper ZkLeanTests"
 
+      # An independent Lean 4 kernel, in Rust. It is what makes the export
+      # tests meaningful: without it they only check that we agree with
+      # ourselves. Pinned to a commit so a breaking change upstream shows up
+      # as a deliberate bump rather than a mystery failure.
+      - name: Build the independent kernel (nanoda_lib)
+        run: |
+          git clone https://github.com/ammkrn/nanoda_lib /tmp/nanoda
+          cd /tmp/nanoda && git checkout 0505569 && cargo build --release
+
       - name: Portable verifier self-test
         run: python3 zklean/zklean.py selftest
 
-      - name: End-to-end suite (seal, check, tamper, reject)
+      - name: End-to-end suite (seal, check, export, cross-check, reject)
         run: ./test/run.py
+        env:
+          ZKLEAN_NANODA: /tmp/nanoda/target/release/nanoda_bin

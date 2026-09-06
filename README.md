@@ -28,22 +28,36 @@ else from the repository is in the file.
 
 ## What this is, precisely
 
-**This is obfuscation with verifiability, not a zero-knowledge proof.** The
-distinction matters, so it is worth being blunt about it.
+**This is obfuscation with verifiability. It is not yet a zero-knowledge
+proof.** The distinction matters, so it is worth being blunt about it.
 
-The artifact *contains* the proof term — that is how the kernel can check it.
+The artifact *contains* the proof term — that is how a kernel can check it.
 What sealing removes is everything around it: source text, comments,
 docstrings, tactic scripts, file structure, every name your development
 introduced, every binder name, every universe parameter name, and every
 declaration the target does not depend on. What survives is a fully explicit
-term that no human will read for pleasure, but that the kernel accepts or
-rejects with no ambiguity.
+term that no human will read for pleasure, but that a kernel accepts or rejects
+with no ambiguity.
 
-A genuine zero-knowledge proof — one where the verifier learns *nothing* beyond
-"a proof exists" — would require running Lean's type checker inside a
-zk-SNARK/STARK circuit. That is a much larger and much riskier project, and
-nothing here pretends to do it. What is offered instead is sound: the checking
-is done by the actual Lean kernel, so a `VALID` verdict means what it says.
+A genuine zero-knowledge proof — where the verifier learns *nothing* beyond
+"a proof exists" — needs Lean's type checker to run inside a circuit. See
+[the roadmap](#roadmap-to-an-actual-zero-knowledge-proof); the pieces that
+project depends on are built and tested here, and the remaining gap is named
+precisely rather than papered over.
+
+Three things worth knowing before relying on any of this:
+
+- **Resolution is asymmetric.** You can attest *"I hold a proof of P"* or
+  *"I hold a proof of ¬P"*. You cannot attest *"P is undecided"*, and the
+  absence of an artifact is evidence of nothing.
+- **Publishing an attestation leaks the most valuable bit.** "Here is a proof
+  that P holds" tells the world P is resolved and in which direction. Mid
+  research that is often exactly what invites a race. Use `--hide-statement`
+  and publish only the Merkle root when you want priority without disclosure,
+  and open it later.
+- **A `VALID` verdict is about the kernel, not about you.** It says the term
+  type-checks and rests only on the standard axioms. It says nothing about
+  whether the statement is the one you meant to prove.
 
 ## Soundness
 
@@ -118,6 +132,45 @@ Honest limits on the hiding:
   renamed prefix, because the kernel derives recursor names itself. The
   namespace *shape* leaks; the names do not.
 
+## Sealing a whole repository
+
+The headline operation, and the one-way one. It takes a Lean repository and
+produces a standalone, obfuscated one; nothing in the output can reconstruct
+the input, because the salt keying the name mangling is generated fresh and
+discarded.
+
+Run it under the *source* repository's `lake env`, so that repository's modules
+are on the search path:
+
+```console
+$ cd my-conjectures
+$ lake env /path/to/zklean . ../zk-conjectures
+source      : .  (2 modules, package root /home/me/my-conjectures)
+theorems    : 2 sealed
+salt        : random, and discarded -- the mapping is not recoverable
+merkle root : cc27c97a99aa9f36c9bae524722dba64766d8ae53648dde7bfa65e5436399145
+output      : ../zk-conjectures
+```
+
+What the recipient gets, and what they can do with it:
+
+```console
+$ zklean check ../zk-conjectures/*.zkl.json
+VALID    _zk8859ea58f678d97a.zkl.json
+  statement   : Conjectures.AllReach 32 128
+  declarations: 267 (standalone; all accepted by the kernel)
+  axioms      : none
+```
+
+The claim is legible. The proof is 267 obfuscated declarations. The theorem's
+own name, the module it lived in, and every lemma reached only through the
+proof are gone. What survives is the statement's vocabulary — `AllReach`,
+`step`, `reaches` — and it has to: an attestation to an unreadable claim
+attests to nothing.
+
+`test/fixtures/conjectures` is a working example of this shape — a conjecture
+over a finite range, resolved by `decide`.
+
 ## Committing a whole development
 
 `zklean commit` seals every theorem in a module and binds the results to one
@@ -168,12 +221,77 @@ zklean commit MODULE ...          seal everything and commit it to one Merkle ro
 Sealing is deterministic given a salt: the same development and salt produce
 byte-identical artifacts and the same root.
 
+## Independent verification
+
+An artifact sealed with `--standalone` carries its entire transitive closure,
+down to `Nat` and `Eq`. It is checked against a *literally empty* environment
+and needs no Lean installation, no `.olean` files, and no import path. For a
+hand-written proof that is only a few dozen declarations:
+
+| theorem | standalone closure |
+| --- | --- |
+| `0 + n = n` | 37 declarations |
+| `sum_mirror` (inductive + recursion) | 59 declarations |
+| `double_eq` (proved by `omega`) | 1381 declarations |
+
+`zklean export` then re-emits a checked artifact in Lean's official
+[NDJSON export format](https://github.com/leanprover/lean4export) (v3.1.0), so
+an *independent* kernel can check it — no part of this repository is in that
+trust path:
+
+```console
+$ zklean export zkl/_zk92f6….zkl.json -o out
+$ nanoda_bin out/config.json
+Checked 44 declarations with no typechecker errors
+```
+
+That is [`nanoda_lib`](https://github.com/ammkrn/nanoda_lib), a Lean 4 kernel
+written in Rust. It accepts the sealed, obfuscated, standalone artifacts —
+including a 1428-declaration `omega` proof pulling in nested inductives like
+`Lean.Syntax` — and independently rejects the `sorry` fixture for depending on
+`sorryAx`. Writing a *second* kernel here would have been a mistake: a kernel
+that is only mostly right is an unsound verifier, which is worse than none.
+
+## Roadmap to an actual zero-knowledge proof
+
+The target statement is `∃ π. kernel(P, π) = accept`, with `P` public and `π`
+private. Getting there needs three things. Two are done:
+
+1. **A self-contained witness.** ✅ `--standalone` artifacts check against an
+   empty environment. This is the hard prerequisite: a prover running inside a
+   circuit or a zkVM receives a byte array and cannot open `.olean` files.
+2. **An independent checker that consumes it.** ✅ `zklean export` speaks the
+   standard export format, and `nanoda_lib` — plain Rust, no Lean — checks it.
+3. **A proof of that checker's execution.** ❌ Not built. Compile a checker to
+   a zkVM guest (RISC Zero, SP1), pass the witness as *private* input, and
+   publish only the journal: the statement hash, the axiom list, and the accept
+   bit.
+
+Step 3 is engineering, not research — but it is not cheap, and the honest
+obstacle is cost, not architecture. A Lean kernel does unbounded definitional
+equality search; proving even the 44-declaration example above would be
+millions of zkVM cycles, and the 1428-declaration `omega` proof is likely
+out of reach without first shrinking the witness. Elementary, hand-written
+proofs — which is what most Erdős-style statements have — are the tractable
+case, and that is exactly the case where the closure measured above stays small.
+
 ## Build
 
 ```console
 lake build
 ./test/run.py
 ```
+
+The suite cross-checks every export against an independent Lean kernel when one
+is available. To enable that locally:
+
+```console
+git clone https://github.com/ammkrn/nanoda_lib && cd nanoda_lib && cargo build --release
+ZKLEAN_NANODA=$PWD/target/release/nanoda_bin ./test/run.py
+```
+
+Without it those checks are skipped and say so; the rest of the suite is
+unaffected.
 
 The Lean-side vectors in `test/ZkLeanTests/Vectors.lean` run during `lake build`
 via `#guard`, so a regression in SHA-256 or the Merkle construction breaks the
@@ -195,9 +313,11 @@ ZkLean/Merkle.lean   domain-separated Merkle tree; wire-compatible with the Pyth
 ZkLean/Wire.lean     canonical JSON codec for Name / Level / Expr / ConstantInfo
 ZkLean/Seal.lean     the obfuscating exporter
 ZkLean/Check.lean    kernel replay and axiom audit
+ZkLean/Export.lean   emitter for Lean's official NDJSON export format
 ZkLean/Cli.lean      the command line
 ZkLean/Demo.lean     a small development to seal, used by the tests
 ZkLean/DemoAux.lean  a second module, so the tests can exercise --include
 zklean/zklean.py     portable commitment verifier (Python 3.8+, stdlib only)
 test/                adversarial fixtures, a dishonest prover, and the test suite
+test/fixtures/       a separate Lean package, for testing whole-repository sealing
 ```
