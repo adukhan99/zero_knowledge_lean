@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Builds every library and executable. The `#guard` vectors in
+      # test/ZkLeanTests/Vectors.lean are evaluated during this step, so a
+      # regression in SHA-256 or the Merkle construction fails the build.
+      - uses: leanprover/lean-action@v1
+        with:
+          build-args: "zklean zklean-tamper ZkLeanTests"
+
+      - name: Portable verifier self-test
+        run: python3 zklean/zklean.py selftest
+
+      - name: End-to-end suite (seal, check, tamper, reject)
+        run: ./test/run.py

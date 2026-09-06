@@ -1,0 +1,21 @@
+name = "zklean"
+version = "0.2.0"
+defaultTargets = ["zklean"]
+
+[[lean_lib]]
+name = "ZkLean"
+
+[[lean_exe]]
+name = "zklean"
+root = "Main"
+supportInterpreter = true
+
+[[lean_lib]]
+name = "ZkLeanTests"
+srcDir = "test"
+
+[[lean_exe]]
+name = "zklean-tamper"
+srcDir = "test"
+root = "ZkLeanTests.Tamper"
+supportInterpreter = true
