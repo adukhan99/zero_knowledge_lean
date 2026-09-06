@@ -252,6 +252,36 @@ including a 1428-declaration `omega` proof pulling in nested inductives like
 `sorryAx`. Writing a *second* kernel here would have been a mistake: a kernel
 that is only mostly right is an unsound verifier, which is worse than none.
 
+## Prior art
+
+**[zkPi](https://eprint.iacr.org/2024/267) (Laufer, Ozdemir & Boneh, Stanford,
+ACM CCS 2024) already does step 3 below**, and does it properly: it is the first
+zkSNARK for Lean proofs, built on CirC and Mirage over R1CS, with
+implementations for both Lean 3 and Lean 4. Its statement is exactly the one
+this roadmap targets — the prover holds a Lean proof of a public theorem `T`
+and convinces a verifier without revealing the proof. Reported coverage for
+Lean 4 is 43.4% of stdlib and 11.1% of mathlib, at up to 4.5 minutes per
+theorem, with proofs short enough to "fit in Fermat's margin". Code:
+[emlaufer/zkpi](https://github.com/emlaufer/zkpi).
+
+zkPi consumes Lean's export format, which is the same interface `zklean export`
+targets — but the *legacy* line-based one (`#NS` / `#EA` / `#EP`), pinned to
+Lean `v4.8.0-rc1`, not the NDJSON v3.1.0 this emitter produces for `v4.33.1`.
+Feeding zkPi would mean adding a legacy-format emitter and reconciling the
+toolchain gap. That is a serialisation exercise, not a redesign.
+
+What zkPi does **not** do, and what this repository is therefore about: it takes
+an export you already have and proves a public statement. It does not obfuscate
+a development, minimise a proof's closure, commit a repository to a Merkle root
+for selective disclosure, audit axioms as a first-class verdict, or offer a
+one-way repository-to-repository operation. Those are the parts built here.
+
+Related but distinct:
+[`is-my-lean-proof-vacuous`](https://github.com/LionSR/is-my-lean-proof-vacuous)
+audits `#print axioms` to catch formalisations that compile but claim nothing —
+the same insight as the audit here, aimed at fraud detection rather than
+privacy, and with no cryptography.
+
 ## Roadmap to an actual zero-knowledge proof
 
 The target statement is `∃ π. kernel(P, π) = accept`, with `P` public and `π`
@@ -262,18 +292,25 @@ private. Getting there needs three things. Two are done:
    circuit or a zkVM receives a byte array and cannot open `.olean` files.
 2. **An independent checker that consumes it.** ✅ `zklean export` speaks the
    standard export format, and `nanoda_lib` — plain Rust, no Lean — checks it.
-3. **A proof of that checker's execution.** ❌ Not built. Compile a checker to
-   a zkVM guest (RISC Zero, SP1), pass the witness as *private* input, and
-   publish only the journal: the statement hash, the axiom list, and the accept
-   bit.
+3. **A proof of that checker's execution.** ❌ Not built here — and see
+   [prior art](#prior-art), because zkPi has already done it. Either reuse zkPi
+   (add a legacy-format emitter) or compile a checker to a zkVM guest, pass the
+   witness as *private* input, and publish only the journal: the statement hash,
+   the axiom list, and the accept bit.
 
-Step 3 is engineering, not research — but it is not cheap, and the honest
-obstacle is cost, not architecture. A Lean kernel does unbounded definitional
-equality search; proving even the 44-declaration example above would be
-millions of zkVM cycles, and the 1428-declaration `omega` proof is likely
-out of reach without first shrinking the witness. Elementary, hand-written
-proofs — which is what most Erdős-style statements have — are the tractable
-case, and that is exactly the case where the closure measured above stays small.
+Two cautions on the zkVM route. First, **a zkVM proof is succinct but not
+automatically zero-knowledge** — in most zkVMs "zk" names succinctness, and
+actual privacy requires an extra and expensive wrapping step. Getting that
+wrong yields a proof that is short and leaks the witness anyway. Second, the
+obstacle is cost, not architecture: a Lean kernel does unbounded definitional
+equality search, so even the 44-declaration example above is millions of
+cycles, and the 1428-declaration `omega` proof is likely out of reach without
+shrinking the witness first.
+
+Elementary, hand-written proofs — what most Erdős-style statements have — are
+the tractable case, and are exactly where the closures measured above stay
+small. That is also where `--standalone` minimisation earns its keep, since
+circuit cost tracks witness size directly.
 
 ## Build
 
