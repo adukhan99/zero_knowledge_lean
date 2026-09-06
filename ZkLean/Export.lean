@@ -345,9 +345,11 @@ Differences the format forces:
 * reducibility hints are dropped, being a performance annotation only.
 -/
 
+private def hexDigitsUpper : Array Char :=
+  #['0','1','2','3','4','5','6','7','8','9','A','B','C','D','E','F']
+
 private def hexByte (b : UInt8) : String :=
-  let d := "0123456789ABCDEF"
-  s!"{d.get ⟨b.toNat / 16⟩}{d.get ⟨b.toNat % 16⟩}"
+  s!"{hexDigitsUpper[b.toNat / 16]!}{hexDigitsUpper[b.toNat % 16]!}"
 
 private def binderTag : Nat -> String
   | 0 => "#BD" | 1 => "#BI" | 2 => "#BS" | _ => "#BC"
