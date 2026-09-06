@@ -6,25 +6,25 @@ standard axioms, with no `sorry`"* without receiving your source, your tactics,
 your names, or any other theorem in your development.
 
 ```console
-$ zklean seal ZkLean.Demo ZkLean.Demo.sum_mirror
-salt        : 0f3c…  (keep this to re-derive the mapping)
-ZkLean.Demo.sum_mirror
-  sealed as : _zkb500dbb9abfb8676
-  hidden    : 2 declarations   public: 12
-  artifact  : zkl/_zkb500dbb9abfb8676.zkl.json
+$ cd my-conjectures
+$ lake env /path/to/zklean . ../zk-conjectures      # a whole repo, one way
+theorems    : 5 sealed
+salt        : random, and discarded -- the mapping is not recoverable
+merkle root : 2cc450ec1db01b14c3122ba9258668888adb499751974160bc1c36f3eb949eb6
 
-$ zklean check zkl/_zkb500dbb9abfb8676.zkl.json
-VALID    zkl/_zkb500dbb9abfb8676.zkl.json
-  target      : _zkb500dbb9abfb8676
-  statement   : ∀ (x : ZkLean.Demo.Tree),
-                  Eq (ZkLean.Demo.Tree.sum (ZkLean.Demo.Tree.mirror x))
-                     (ZkLean.Demo.Tree.sum x)
-  declarations: 14 (all accepted by the kernel)
+$ zklean check ../zk-conjectures/*.zkl.json
+VALID    _zk1f3c6f8143f0c3a6.zkl.json
+  target      : _zk1f3c6f8143f0c3a6
+  statement   : (x : Conjectures.Tree) → @Eq Conjectures.Tree
+                  (Conjectures.Tree.mirror (Conjectures.Tree.mirror x)) x
+  declarations: 25 (standalone; all accepted by the kernel)
   axioms      : none
 ```
 
-The statement is legible. The proof is a name-stripped elaborated term. Nothing
-else from the repository is in the file.
+The statement is legible. The proof is a name-stripped elaborated term. The
+theorem's own name, the module it lived in, and every lemma reached only through
+the proof are gone — and the salt that produced the mapping was never written
+down.
 
 ## What this is, precisely
 
@@ -40,10 +40,14 @@ term that no human will read for pleasure, but that a kernel accepts or rejects
 with no ambiguity.
 
 A genuine zero-knowledge proof — where the verifier learns *nothing* beyond
-"a proof exists" — needs Lean's type checker to run inside a circuit. See
-[the roadmap](#roadmap-to-an-actual-zero-knowledge-proof); the pieces that
-project depends on are built and tested here, and the remaining gap is named
-precisely rather than papered over.
+"a proof exists" — needs Lean's type checker to run inside a circuit. That is
+[zkPi](#prior-art)'s job, not this project's. What is built here is the layer
+around it: minimising a proof to a self-contained witness, obfuscating what does
+not need to be disclosed, committing a repository so single theorems can be
+revealed selectively, auditing axioms, and emitting the formats independent
+checkers read. `zklean export --format legacy` hands zkPi its input; see
+[Reaching a zero-knowledge proof](#reaching-a-zero-knowledge-proof) for what
+that does and does not currently get you.
 
 Three things worth knowing before relying on any of this:
 
@@ -146,9 +150,9 @@ are on the search path:
 $ cd my-conjectures
 $ lake env /path/to/zklean . ../zk-conjectures
 source      : .  (2 modules, package root /home/me/my-conjectures)
-theorems    : 2 sealed
+theorems    : 5 sealed
 salt        : random, and discarded -- the mapping is not recoverable
-merkle root : cc27c97a99aa9f36c9bae524722dba64766d8ae53648dde7bfa65e5436399145
+merkle root : 2cc450ec1db01b14c3122ba9258668888adb499751974160bc1c36f3eb949eb6
 output      : ../zk-conjectures
 ```
 
@@ -156,7 +160,7 @@ What the recipient gets, and what they can do with it:
 
 ```console
 $ zklean check ../zk-conjectures/*.zkl.json
-VALID    _zk8859ea58f678d97a.zkl.json
+VALID    _zke1b41bb5c735189d.zkl.json
   statement   : Conjectures.AllReach 32 128
   declarations: 267 (standalone; all accepted by the kernel)
   axioms      : none
@@ -168,8 +172,13 @@ proof are gone. What survives is the statement's vocabulary — `AllReach`,
 `step`, `reaches` — and it has to: an attestation to an unreadable claim
 attests to nothing.
 
-`test/fixtures/conjectures` is a working example of this shape — a conjecture
-over a finite range, resolved by `decide`.
+Only theorems you wrote become targets. The lemmas Lean derives from an
+inductive type — `Tree.leaf.injEq`, `Tree.brecOn.eq` and the rest — are sealed
+when something depends on them, but are not sealed in their own right; naming a
+declaration explicitly (`zklean seal MODULE My.thm`) overrides that.
+
+`test/fixtures/conjectures` is the worked example, and its README walks through
+which theorems clear which stage.
 
 ## Committing a whole development
 
@@ -220,7 +229,8 @@ zklean export ARTIFACT            re-emit for an independent checker
       --format F           `ndjson` (nanoda_lib, lean4lean) or `legacy` (zkPi)
 ```
 
-`check` exits 0 only if every artifact is `VALID`.
+`check` exits 0 only if every artifact is `VALID`. `SRC DST` implies
+`--standalone`, since the output has to stand on its own.
 
 Sealing is deterministic given a salt: the same development and salt produce
 byte-identical artifacts and the same root.
@@ -230,28 +240,38 @@ byte-identical artifacts and the same root.
 An artifact sealed with `--standalone` carries its entire transitive closure,
 down to `Nat` and `Eq`. It is checked against a *literally empty* environment
 and needs no Lean installation, no `.olean` files, and no import path. For a
-hand-written proof that is only a few dozen declarations:
+hand-written proof that is only a few dozen declarations.
 
-| theorem | standalone closure |
-| --- | --- |
-| `0 + n = n` | 37 declarations |
-| `sum_mirror` (inductive + recursion) | 59 declarations |
-| `double_eq` (proved by `omega`) | 1381 declarations |
+The worked example is `test/fixtures/conjectures`. Measured, Lean v4.33.1:
 
-`zklean export` then re-emits a checked artifact in Lean's official
+| theorem | closure | `nanoda_lib` | zkPi | circuit |
+| --- | --- | --- | --- | --- |
+| `iter_zero` — true by computation | 22 | ✅ 27 | ✅ | 1 |
+| `iter_succ` — the recursive step | 34 | ✅ 41 | ✅ | 7 |
+| `mirror_mirror` — structural induction | 25 | ✅ 30 | ✅ | 29 |
+| `double_eq_add` — induction with arithmetic | 48 | ✅ 55 | ✅ | 51 |
+| `all_reach_32` — Collatz below 32, by `decide` | 267 | ✅ 295 | ❌ | — |
+| `double_eq` — proved by `omega` | 1356 | ✅ | ❌ | — |
+
+"Closure" is what the artifact carries. `nanoda_lib`'s count is higher because
+the kernel regenerates the recursors the artifact deliberately omits. "Circuit"
+is zkPi's own size estimate, which is what decides whether proving a given
+theorem is affordable.
+
+`zklean export` re-emits a checked artifact in Lean's official
 [NDJSON export format](https://github.com/leanprover/lean4export) (v3.1.0), so
 an *independent* kernel can check it — no part of this repository is in that
 trust path:
 
 ```console
-$ zklean export zkl/_zk92f6….zkl.json -o out
+$ zklean export art.zkl.json -o out
 $ nanoda_bin out/config.json
-Checked 44 declarations with no typechecker errors
+Checked 30 declarations with no typechecker errors
 ```
 
 That is [`nanoda_lib`](https://github.com/ammkrn/nanoda_lib), a Lean 4 kernel
 written in Rust. It accepts the sealed, obfuscated, standalone artifacts —
-including a 1428-declaration `omega` proof pulling in nested inductives like
+including a 1428-declaration `omega` proof that pulls in nested inductives like
 `Lean.Syntax` — and independently rejects the `sorry` fixture for depending on
 `sorryAx`. Writing a *second* kernel here would have been a mistake: a kernel
 that is only mostly right is an unsound verifier, which is worse than none.
@@ -268,33 +288,31 @@ Lean 4 is 43.4% of stdlib and 11.1% of mathlib, at up to 4.5 minutes per
 theorem, with proofs short enough to "fit in Fermat's margin". Code:
 [emlaufer/zkpi](https://github.com/emlaufer/zkpi).
 
-`zklean export --format legacy` emits the line-based format zkPi reads, so
-**you can bridge to it yourself** — install zkPi, point it at the file. We
-neither bundle nor redistribute it, and take on none of its guarantees: whatever
-zkPi concludes is between you and zkPi. That is deliberate. Emitting a file
-format is not a derivative work, and this format is *Lean's* anyway — zkPi is a
-consumer of it exactly as `nanoda_lib` is a consumer of the NDJSON one.
-
-Tested, not assumed. Against zkPi built from `master`, on exports produced from
-Lean v4.33.1 (zkPi pins v4.8.0-rc1, 25 versions earlier):
+`zklean export --format legacy` writes the line-based format zkPi reads, so you
+can bridge to it yourself:
 
 ```console
 $ zklean export art.zkl.json --format legacy -o out
-$ zkpi out/_zk92f6….export list        # parses, lists the sealed theorem
-$ zkpi out/_zk92f6….export count _zk92f6…
-COUNT: 37
-1614,1630,261,4052,5,136,8,5,4,1       # circuit sizes
+$ zkpi out/_zk1f3c….export list                # parses; lists the sealed theorem
+$ zkpi out/_zk1f3c….export count _zk1f3c…
+COUNT: 29                                      # circuit size
 ```
 
-**The version gap is not the binding constraint; zkPi's supported fragment is.**
-It refuses recursion on inductive families with recursive parameters, and
-`Nat.le` is one — so anything reaching for `≤` (`omega`, `decide` over a bounded
-range, arithmetic `simp`) is outside what it can handle today, and fails with an
-explicit panic rather than silently. Elementary equational proofs go through.
-This is the same wall behind the paper's reported 43.4% / 11.1% coverage, and it
-is worth knowing before planning around it: the finite-range combinatorial
-statements that look most attractive for this use case are, today, mostly on the
-wrong side of it.
+zkPi is neither bundled nor redistributed here, and none of its guarantees are
+claimed: you install it, you point it at the file, and whatever it concludes is
+between you and zkPi. Emitting a file format needs nobody's permission — and
+this format is *Lean's* anyway, which zkPi consumes exactly as `nanoda_lib`
+consumes the NDJSON one.
+
+Tested, not assumed: zkPi pins Lean `v4.8.0-rc1` and these exports come from
+`v4.33.1`, 25 versions later. Its front end takes them without complaint, so
+**the version gap is not the binding constraint — zkPi's supported fragment
+is**, as described under [Reaching a zero-knowledge
+proof](#reaching-a-zero-knowledge-proof).
+
+Reproducing this needs a 2023 Rust nightly, and zkPi's GMP dependency will not
+configure under GCC 14+ without `CFLAGS=-std=gnu17` (C23 changed `void g(){}`
+from "unspecified parameters" to "none", breaking a GMP probe).
 
 What zkPi does **not** do, and what this repository is therefore about: it takes
 an export you already have and proves a public statement. It does not obfuscate
@@ -308,35 +326,37 @@ audits `#print axioms` to catch formalisations that compile but claim nothing �
 the same insight as the audit here, aimed at fraud detection rather than
 privacy, and with no cryptography.
 
-## Roadmap to an actual zero-knowledge proof
+## Reaching a zero-knowledge proof
 
 The target statement is `∃ π. kernel(P, π) = accept`, with `P` public and `π`
-private. Getting there needs three things. Two are done:
+private. Three pieces are needed:
 
 1. **A self-contained witness.** ✅ `--standalone` artifacts check against an
-   empty environment. This is the hard prerequisite: a prover running inside a
-   circuit or a zkVM receives a byte array and cannot open `.olean` files.
-2. **An independent checker that consumes it.** ✅ `zklean export` speaks the
-   standard export format, and `nanoda_lib` — plain Rust, no Lean — checks it.
-3. **A proof of that checker's execution.** ❌ Not built here — and see
-   [prior art](#prior-art), because zkPi has already done it. Either reuse zkPi
-   (add a legacy-format emitter) or compile a checker to a zkVM guest, pass the
-   witness as *private* input, and publish only the journal: the statement hash,
-   the axiom list, and the accept bit.
+   empty environment. A prover running inside a circuit receives a byte array
+   and cannot open `.olean` files, so nothing works without this.
+2. **A checker that consumes it.** ✅ `zklean export` speaks both interchange
+   formats: NDJSON for `nanoda_lib`, and the legacy line-based one for zkPi.
+3. **A zkSNARK over that checker.** ✅ **zkPi already is one.** That part is
+   not ours to build and [we do not try](#prior-art).
 
-Two cautions on the zkVM route. First, **a zkVM proof is succinct but not
-automatically zero-knowledge** — in most zkVMs "zk" names succinctness, and
-actual privacy requires an extra and expensive wrapping step. Getting that
-wrong yields a proof that is short and leaks the witness anyway. Second, the
-obstacle is cost, not architecture: a Lean kernel does unbounded definitional
-equality search, so even the 44-declaration example above is millions of
-cycles, and the 1428-declaration `omega` proof is likely out of reach without
-shrinking the witness first.
+So the chain closes for elementary proofs, and the remaining constraint is not
+architectural. It is **zkPi's supported fragment**: it refuses recursion on
+inductive families with recursive parameters, and `Nat.le` is one. Anything
+reaching for `≤` — `omega`, arithmetic `simp`, and `decide` over a bounded
+range — is out, and fails loudly rather than silently.
 
-Elementary, hand-written proofs — what most Erdős-style statements have — are
-the tractable case, and are exactly where the closures measured above stay
-small. That is also where `--standalone` minimisation earns its keep, since
-circuit cost tracks witness size directly.
+That last one stings, because finite-range combinatorial claims are exactly the
+shape that looks most attractive for zero-knowledge disclosure, and bounded
+quantification *is* `Nat.le`. It is the same wall behind the paper's reported
+43.4% / 11.1% coverage. Equational reasoning over user-defined structures goes
+through today; bounded search does not.
+
+Two cautions if you ever consider a zkVM instead. **A zkVM proof is succinct
+but not automatically zero-knowledge** — in most zkVMs "zk" names succinctness,
+and real privacy needs a separate, expensive wrapping step; getting that wrong
+yields a short proof that leaks the witness anyway. And the cost is dominated by
+unbounded definitional-equality search, so witness size is the thing to
+minimise — which is what `--standalone` closure minimisation is for.
 
 ## Build
 

@@ -644,20 +644,35 @@ def main() -> int:
             check("seal-repo reports a discarded salt",
                   "discarded" in r.stdout, r.stdout)
             arts = sorted(zkout.glob("*.zkl.json"))
-            check("seal-repo sealed both theorems", len(arts) == 2,
+            check("seal-repo sealed every theorem in the fixture", len(arts) == 5,
                   f"{len(arts)} artifacts")
             check("seal-repo wrote a transcript", (zkout / "transcript.json").exists())
 
-            # One-way: the theorem and module names must not survive. The
-            # statement's own vocabulary does, and must -- an attestation to an
-            # unreadable claim attests to nothing.
+            # Elaborator-generated lemmas are dependencies, not targets. If the
+            # filter regresses, this fixture seals 12 declarations instead of 5.
+            r2 = subprocess.run(["lake", "env", str(ZKLEAN), "seal", "Conjectures.Collatz",
+                                 "--salt", "t", "-o", str(tmp / "gen-check")],
+                                cwd=fixture, capture_output=True, text=True, env=lake_env())
+            named = [l for l in r2.stdout.splitlines() if l.startswith("Conjectures.")]
+            check("generated lemmas are not sealed as targets", len(named) == 5,
+                  "\n".join(named))
+            check("no generated lemma appears among the targets",
+                  not any(g in "".join(named)
+                          for g in ("injEq", "sizeOf_spec", "brecOn", ".inj")),
+                  "\n".join(named))
+
+            # One-way: theorem names and the module they lived in must not
+            # survive. The statement's own vocabulary does, and must -- an
+            # attestation to an unreadable claim attests to nothing.
             blob = "".join(f.read_text() for f in arts)
-            for gone in ("all_reach_32", "step_double", "Collatz"):
-                check(f"seal-repo hides {gone}", gone not in blob)
-            # Names are encoded componentwise (["Conjectures","step"]), so
-            # look for the components rather than a dotted string.
-            check("seal-repo keeps the statement's vocabulary",
-                  '"AllReach"' in blob and '"step"' in blob and '"Conjectures"' in blob)
+            for gone in ("all_reach_32", "mirror_mirror", "double_eq_add",
+                         "iter_zero", "Collatz"):
+                check(f"seal-repo hides the theorem name {gone}", gone not in blob)
+            # Names are encoded componentwise (["Conjectures","step"]), so look
+            # for components rather than a dotted string.
+            for kept in ("AllReach", "Tree", "double", "iter", "Conjectures"):
+                check(f"seal-repo keeps the statement vocabulary {kept}",
+                      f'"{kept}"' in blob)
 
             p = run(str(ZKLEAN), "check", *map(str, arts), expect=0)
             check("sealed repository verifies against an empty environment",

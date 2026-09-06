@@ -109,16 +109,47 @@ def loadEnvs (mods : Array Name) (extra : Array Name) :
             direct := direct.push imp.module
   return (env, base, if direct.isEmpty then #[`Init] else direct)
 
-/-- Every theorem the sealed development itself declares, excluding the ones
-the elaborator generates (`.injEq`, `.sizeOf_spec`, equation lemmas, ...) and
-private helpers. Those are still sealed when a target depends on them; they are
-just not targets in their own right. -/
+/-- Components Lean uses for declarations it generates itself.
+
+There is no reliable flag for "the elaborator wrote this". `isReservedName`
+does not cover the lemmas derived from an inductive type -- it answers false for
+`Tree.leaf.injEq` and friends -- and every generated lemma carries a source
+position, so declaration ranges do not separate them either. Matching whole name
+components is a heuristic, but a conservative one: a component must equal one of
+these exactly, so a theorem called `below_diagonal` or `rec_unique` is untouched.
+
+Getting it wrong only affects which declarations are sealed *by default*. A
+skipped theorem can always be sealed by naming it: `zklean seal MODULE My.thm`.
+-/
+def generatedComponents : Array String :=
+  #["inj", "injEq", "sizeOf_spec", "noConfusion", "noConfusionType",
+    "brecOn", "below", "ibelow", "binductionOn", "rec", "recOn", "casesOn",
+    "ndrec", "ndrecOn", "induct", "fun_cases", "eq_def", "eq_zero", "eq_succ"]
+
+/-- Whether `n` looks like something the elaborator generated. -/
+def isGeneratedName (n : Name) : Bool :=
+  let rec go : Name -> Bool
+    | .anonymous => false
+    | .num _ _ => true
+    | .str p c =>
+      generatedComponents.contains c
+      -- `eq_1`, `match_3`, `proof_7`, ... are all generated.
+      || (["eq_", "match_", "proof_", "unfold_"].any fun pre =>
+            c.startsWith pre && !(c.drop pre.length).isEmpty
+              && (c.drop pre.length).toString.all Char.isDigit)
+      || go p
+  go n
+
+/-- Every theorem the sealed development itself declares, excluding private
+helpers and anything the elaborator generated (`.injEq`, `.sizeOf_spec`,
+equation lemmas, ...). Skipped declarations are still sealed when a target
+depends on them; they are just not targets in their own right. -/
 def localTheorems (env base : Environment) : Array Name :=
   let ns := env.constants.fold (init := #[]) fun acc n ci =>
     if (findConst? base n).isSome then acc
     else if ci matches .thmInfo _ then
-      if n.isInternal || Lean.isReservedName env n || Lean.isAuxRecursor env n
-         || Lean.isNoConfusion env n then acc
+      if n.isInternal || isGeneratedName n || Lean.isReservedName env n
+         || Lean.isAuxRecursor env n || Lean.isNoConfusion env n then acc
       else acc.push n
     else acc
   ns.qsort (fun a b => a.toString < b.toString)
