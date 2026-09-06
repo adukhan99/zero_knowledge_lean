@@ -34,3 +34,7 @@ jobs:
         run: ./test/run.py
         env:
           ZKLEAN_NANODA: /tmp/nanoda/target/release/nanoda_bin
+      # zkPi is deliberately not built in CI: it needs a 2023 Rust nightly and
+      # builds GMP from source, which is slow and brittle. The legacy-format
+      # tests validate structurally without it; set ZKLEAN_ZKPI locally to add
+      # the cross-check.

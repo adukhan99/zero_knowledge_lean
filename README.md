@@ -204,9 +204,11 @@ reproduce Lean's JSON serialiser to check one.
 ## Commands
 
 ```
+zklean SRC DST                    seal a whole repository, one-way
 zklean seal   MODULE [DECL ...]   seal declarations (default: every theorem in MODULE)
 zklean check  ARTIFACT ...        re-check artifacts with the Lean kernel
 zklean commit MODULE ...          seal everything and commit it to one Merkle root
+zklean export ARTIFACT            re-emit for an independent checker
 
   -o, --out DIR            output directory (default: zkl)
       --salt S             fixed salt; reproducible, but invertible by anyone who
@@ -214,6 +216,8 @@ zklean commit MODULE ...          seal everything and commit it to one Merkle ro
       --hide-statement     obfuscate the target's statement as well as its proof
       --include M1,M2      also treat these modules as part of the sealed development
       --allow-axioms A,B   extra axioms `check` will tolerate
+      --standalone         carry the whole closure; no Lean needed to check
+      --format F           `ndjson` (nanoda_lib, lean4lean) or `legacy` (zkPi)
 ```
 
 `check` exits 0 only if every artifact is `VALID`.
@@ -264,11 +268,33 @@ Lean 4 is 43.4% of stdlib and 11.1% of mathlib, at up to 4.5 minutes per
 theorem, with proofs short enough to "fit in Fermat's margin". Code:
 [emlaufer/zkpi](https://github.com/emlaufer/zkpi).
 
-zkPi consumes Lean's export format, which is the same interface `zklean export`
-targets — but the *legacy* line-based one (`#NS` / `#EA` / `#EP`), pinned to
-Lean `v4.8.0-rc1`, not the NDJSON v3.1.0 this emitter produces for `v4.33.1`.
-Feeding zkPi would mean adding a legacy-format emitter and reconciling the
-toolchain gap. That is a serialisation exercise, not a redesign.
+`zklean export --format legacy` emits the line-based format zkPi reads, so
+**you can bridge to it yourself** — install zkPi, point it at the file. We
+neither bundle nor redistribute it, and take on none of its guarantees: whatever
+zkPi concludes is between you and zkPi. That is deliberate. Emitting a file
+format is not a derivative work, and this format is *Lean's* anyway — zkPi is a
+consumer of it exactly as `nanoda_lib` is a consumer of the NDJSON one.
+
+Tested, not assumed. Against zkPi built from `master`, on exports produced from
+Lean v4.33.1 (zkPi pins v4.8.0-rc1, 25 versions earlier):
+
+```console
+$ zklean export art.zkl.json --format legacy -o out
+$ zkpi out/_zk92f6….export list        # parses, lists the sealed theorem
+$ zkpi out/_zk92f6….export count _zk92f6…
+COUNT: 37
+1614,1630,261,4052,5,136,8,5,4,1       # circuit sizes
+```
+
+**The version gap is not the binding constraint; zkPi's supported fragment is.**
+It refuses recursion on inductive families with recursive parameters, and
+`Nat.le` is one — so anything reaching for `≤` (`omega`, `decide` over a bounded
+range, arithmetic `simp`) is outside what it can handle today, and fails with an
+explicit panic rather than silently. Elementary equational proofs go through.
+This is the same wall behind the paper's reported 43.4% / 11.1% coverage, and it
+is worth knowing before planning around it: the finite-range combinatorial
+statements that look most attractive for this use case are, today, mostly on the
+wrong side of it.
 
 What zkPi does **not** do, and what this repository is therefore about: it takes
 an export you already have and proves a public statement. It does not obfuscate

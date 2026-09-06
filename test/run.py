@@ -152,6 +152,113 @@ def validate_ndjson(path: Path) -> list[str]:
     return errs
 
 
+LEGACY_BINFO = {"#BD", "#BI", "#BS", "#BC"}
+
+
+def validate_legacy(path: Path) -> list[str]:
+    """Structural check of a legacy-format export.
+
+    Same contract as `validate_ndjson`: every index defined before use, every
+    reference resolving, correct arity per tag. This is what catches a
+    mis-serialised `#IND` -- whose constructor list is length-prefixed, so an
+    off-by-one silently shifts the level parameters.
+    """
+    names, levels, exprs = {0}, {0}, set()
+    errs: list[str] = []
+
+    def need(tbl: set, idx: int, ln: int, what: str) -> None:
+        if idx not in tbl:
+            errs.append(f"line {ln}: undefined {what} index {idx}")
+
+    for ln, raw in enumerate(path.read_text().splitlines(), 1):
+        t = raw.split()
+        if not t:
+            continue
+        if t[0].startswith("#"):
+            tag, a = t[0], [int(x) for x in t[1:]]
+            if tag == "#QUOT":
+                if a:
+                    errs.append(f"line {ln}: #QUOT takes no arguments")
+            elif tag == "#AX":
+                need(names, a[0], ln, "name"); need(exprs, a[1], ln, "expr")
+                for x in a[2:]:
+                    need(names, x, ln, "level param")
+            elif tag == "#DEF":
+                need(names, a[0], ln, "name")
+                need(exprs, a[1], ln, "expr"); need(exprs, a[2], ln, "expr")
+                for x in a[3:]:
+                    need(names, x, ln, "level param")
+            elif tag == "#IND":
+                nm, ty, nctors, rest = a[1], a[2], a[3], a[4:]
+                need(names, nm, ln, "name"); need(exprs, ty, ln, "expr")
+                if len(rest) < 2 * nctors:
+                    errs.append(f"line {ln}: #IND says {nctors} ctors, has {len(rest)} indices")
+                else:
+                    for i in range(nctors):
+                        need(names, rest[2 * i], ln, "ctor name")
+                        need(exprs, rest[2 * i + 1], ln, "ctor type")
+                    for x in rest[2 * nctors:]:
+                        need(names, x, ln, "level param")
+            else:
+                errs.append(f"line {ln}: unknown declaration tag {tag}")
+            continue
+        idx, tag, a = int(t[0]), t[1], t[2:]
+        if tag in ("#NS", "#NI"):
+            need(names, int(a[0]), ln, "name"); names.add(idx)
+        elif tag == "#US":
+            need(levels, int(a[0]), ln, "level"); levels.add(idx)
+        elif tag in ("#UM", "#UIM"):
+            for x in a[:2]:
+                need(levels, int(x), ln, "level")
+            levels.add(idx)
+        elif tag == "#UP":
+            need(names, int(a[0]), ln, "name"); levels.add(idx)
+        elif tag == "#EV":
+            exprs.add(idx)
+        elif tag == "#ES":
+            need(levels, int(a[0]), ln, "level"); exprs.add(idx)
+        elif tag == "#EC":
+            need(names, int(a[0]), ln, "name")
+            for x in a[1:]:
+                need(levels, int(x), ln, "level")
+            exprs.add(idx)
+        elif tag == "#EA":
+            for x in a[:2]:
+                need(exprs, int(x), ln, "expr")
+            exprs.add(idx)
+        elif tag in ("#EL", "#EP"):
+            if a[0] not in LEGACY_BINFO:
+                errs.append(f"line {ln}: bad binder annotation {a[0]!r}")
+            need(names, int(a[1]), ln, "name")
+            for x in a[2:4]:
+                need(exprs, int(x), ln, "expr")
+            exprs.add(idx)
+        elif tag == "#EZ":
+            need(names, int(a[0]), ln, "name")
+            for x in a[1:4]:
+                need(exprs, int(x), ln, "expr")
+            exprs.add(idx)
+        elif tag == "#EJ":
+            need(names, int(a[0]), ln, "name"); need(exprs, int(a[2]), ln, "expr")
+            exprs.add(idx)
+        elif tag == "#ELN":
+            exprs.add(idx)
+        elif tag == "#ELS":
+            for h in a:
+                if len(h) != 2 or any(c not in "0123456789ABCDEF" for c in h):
+                    errs.append(f"line {ln}: malformed hex byte {h!r}")
+            exprs.add(idx)
+        else:
+            errs.append(f"line {ln}: unknown tag {tag}")
+    return errs
+
+
+def zkpi() -> str | None:
+    """zkPi, if available. Set ZKLEAN_ZKPI to a binary built from
+    https://github.com/emlaufer/zkpi to enable the legacy-format cross-check."""
+    return os.environ.get("ZKLEAN_ZKPI") or shutil.which("zkpi")
+
+
 def nanoda() -> str | None:
     """An independent Lean kernel, if one is available.
 
@@ -385,6 +492,62 @@ def main() -> int:
                 bad_exports += 1
         check("export refuses artifacts the audit rejects", bad_exports == 2,
               f"{bad_exports} refused, expected 2")
+
+        # ---------------------------------------------------------------
+        # The legacy line-based format, for consumers that read it (zkPi).
+        # ---------------------------------------------------------------
+        lg = tmp / "legacy"
+        for f in sa_files:
+            run(str(ZKLEAN), "export", str(f), "--format", "legacy", "-o", str(lg))
+        lgs = sorted(lg.glob("*.export"))
+        check("legacy export produces one file per artifact", len(lgs) == len(sa_files),
+              f"{len(lgs)} vs {len(sa_files)}")
+        for f in lgs:
+            errs = validate_legacy(f)
+            check(f"{f.name[:14]}… is structurally valid legacy format", not errs,
+                  "\n".join(errs[:6]))
+
+        # The validator must actually bite, or these assertions mean nothing.
+        decoy = tmp / "decoy.export"
+        decoy.write_text("1 #NS 0 Foo\n0 #EC 99 \n")
+        check("legacy validator rejects a dangling index", bool(validate_legacy(decoy)))
+
+        zp = zkpi()
+        if zp:
+            # zkPi pins Lean v4.8.0-rc1; these exports come from v4.33.1. The
+            # claim under test is that the version gap does not break its
+            # front end -- not that zkPi can prove everything, which it cannot
+            # and does not claim to.
+            for f in sa_files:
+                target = json.loads(f.read_text())["target"][0]
+                lgf = lg / f"{target}.export"
+                r = subprocess.run([zp, str(lgf), "list"], capture_output=True, text=True)
+                check(f"zkPi parses {target[:12]}… and finds the sealed theorem",
+                      r.returncode == 0 and target in r.stdout,
+                      (r.stdout[-300:] + r.stderr[-300:]))
+
+            # End-to-end through zkPi's type checker on an elementary proof.
+            # `COUNT:` goes to stderr, not stdout.
+            target = json.loads(sa_files[0].read_text())["target"][0]
+            r = subprocess.run([zp, str(lg / f"{target}.export"), "count", target],
+                               capture_output=True, text=True)
+            check("zkPi type-checks an elementary proof and sizes the circuit",
+                  r.returncode == 0 and "COUNT:" in (r.stdout + r.stderr),
+                  (r.stdout[-300:] + r.stderr[-300:]))
+
+            # Coverage, reported rather than asserted. zkPi refuses recursion on
+            # inductive families with recursive parameters, which `Nat.le` is --
+            # so anything reaching for `≤` (omega, decide over a bounded range,
+            # arithmetic simp) is outside its supported fragment today.
+            ok_n = 0
+            for f in sorted(lg.glob("*.export")):
+                t = f.name[: -len(".export")]
+                r = subprocess.run([zp, str(f), "count", t], capture_output=True, text=True)
+                ok_n += r.returncode == 0
+            print(f"     zkPi coverage on these exports: "
+                  f"{ok_n}/{len(list(lg.glob('*.export')))} type-check")
+        else:
+            print("skip zkPi cross-check (set ZKLEAN_ZKPI to a zkpi binary to enable)")
 
         # ---------------------------------------------------------------
         # Cross-check with an independent kernel, when one is available.

@@ -30,6 +30,9 @@ OPTIONS
       --hide-statement     obfuscate the target's statement as well as its proof
       --standalone         carry the whole closure down to `Nat`, so the artifact
                            checks against an empty environment with no Lean install
+      --format F           export format: `ndjson` (default, Lean v3.1.0, read by
+                           lean4lean / nanoda_lib) or `legacy` (the older
+                           line-based format, read by zkPi)
       --include M1,M2      also treat these modules as part of the sealed development
       --allow-axioms A,B   extra axioms `check` will tolerate (default: the three
                            standard ones -- propext, Classical.choice, Quot.sound)
@@ -42,6 +45,7 @@ structure Opts where
   salt          : Option String := none
   hideStatement : Bool := false
   standalone    : Bool := false
+  legacyFormat  : Bool := false
   include?      : Array Name := #[]
   allowAxioms   : Array Name := standardAxioms
 
@@ -70,6 +74,11 @@ partial def parseOpts (args : List String) (o : Opts := {}) (pos : Array String 
   | "--salt" :: v :: rest => parseOpts rest { o with salt := some v } pos
   | "--hide-statement" :: rest => parseOpts rest { o with hideStatement := true } pos
   | "--standalone" :: rest => parseOpts rest { o with standalone := true } pos
+  | "--format" :: v :: rest =>
+      match v with
+      | "ndjson" => parseOpts rest { o with legacyFormat := false } pos
+      | "legacy" => parseOpts rest { o with legacyFormat := true } pos
+      | _ => throw (IO.userError s!"--format: expected `ndjson` or `legacy`, got {v}")
   | "--include" :: v :: rest => parseOpts rest { o with include? := splitNames v } pos
   | "--allow-axioms" :: v :: rest =>
       parseOpts rest { o with allowAxioms := standardAxioms ++ splitNames v } pos
@@ -276,8 +285,9 @@ def cmdExport (o : Opts) (pos : Array String) : IO UInt32 := do
                  else importModules (a.imports.map fun m => { module := m }) {} (trustLevel := 0)
   let env <- Environment.replay
     (Std.HashMap.ofList (a.constants.toList.map fun c => (c.name, c))) baseEnv
-  let text := exportNdjson env #[a.target]
-  let out := o.outDir / s!"{a.target}.ndjson"
+  let text <- if o.legacyFormat then IO.ofExcept (exportLegacy env #[a.target])
+              else pure (exportNdjson env #[a.target])
+  let out := o.outDir / (if o.legacyFormat then s!"{a.target}.export" else s!"{a.target}.ndjson")
   if let some d := out.parent then IO.FS.createDirAll d
   IO.FS.writeFile out text
   IO.println s!"target      : {a.target}"

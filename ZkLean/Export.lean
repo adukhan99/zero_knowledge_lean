@@ -321,4 +321,160 @@ def exportNdjson (env : Environment) (roots : Array Name) : String :=
   let st := (roots.forM (emitConst env recMap)).run { } |>.2
   String.intercalate "\n" ((#[metaLine] ++ st.lines).toList.map Json.compress) ++ "\n"
 
+
+/-! ## The legacy line-based export format
+
+Lean's original export format, still what some external checkers read --
+notably [zkPi](https://github.com/emlaufer/zkpi), which pins `v4.8.0-rc1`.
+
+Emitting it is pure interoperability: the format is Lean's, not any consumer's,
+and a file format is not a derivative work of the programs that read it. So
+this needs no permission from anyone, and it deliberately takes on none of any
+consumer's guarantees -- it produces a file, and whatever a checker concludes
+from that file is between the user and that checker.
+
+The translation runs over the NDJSON lines rather than re-walking the
+environment, so the two formats cannot drift apart: every index, and the order
+they are defined in, is by construction the same.
+
+Differences the format forces:
+* theorems are emitted as `#DEF`; there is no `#THM`;
+* recursors are dropped, because the format has no way to spell them and every
+  consumer derives them from `#IND` itself;
+* `#QUOT` takes no arguments and declares the whole quotient package at once;
+* reducibility hints are dropped, being a performance annotation only.
+-/
+
+private def hexByte (b : UInt8) : String :=
+  let d := "0123456789ABCDEF"
+  s!"{d.get ⟨b.toNat / 16⟩}{d.get ⟨b.toNat % 16⟩}"
+
+private def binderTag : Nat -> String
+  | 0 => "#BD" | 1 => "#BI" | 2 => "#BS" | _ => "#BC"
+
+private def jNat (j : Json) : Except String Nat := do
+  match j with
+  | .num n => return n.mantissa.natAbs
+  | .str s => match s.toNat? with
+              | some k => return k
+              | none => throw s!"legacy: expected a decimal number, got {s}"
+  | _ => throw "legacy: expected a number"
+
+private def jNats (j : Json) : Except String (List Nat) :=
+  return (<- (<- j.getArr?).mapM jNat).toList
+
+/-- Space-separated, empty for an empty list.
+
+The reference exporter interpolates this after a literal space, so an empty
+list leaves a trailing space on the line. That is reproduced deliberately: the
+goal is byte-identical output, and guessing that a consumer's parser tolerates
+the difference is not worth the risk. -/
+private def seqStr (ns : List Nat) : String := String.intercalate " " (ns.map toString)
+
+/-- Translate one NDJSON record. `none` means "emits nothing in this format". -/
+private def legacyLine (j : Json) (quotDone : Bool) : Except String (Option String × Bool) := do
+  let keep (s : String) : Except String (Option String × Bool) := return (some s, quotDone)
+  if (j.getObjVal? "meta").isOk then return (none, quotDone)
+  -- Primitives carry the index they define.
+  if let .ok idx := j.getObjVal? "in" then
+    let i <- jNat idx
+    if let .ok o := j.getObjVal? "str" then
+      keep s!"{i} #NS {<- jNat (<- o.getObjVal? "pre")} {<- (<- o.getObjVal? "str").getStr?}"
+    else
+      let o <- j.getObjVal? "num"
+      keep s!"{i} #NI {<- jNat (<- o.getObjVal? "pre")} {<- jNat (<- o.getObjVal? "i")}"
+  else if let .ok idx := j.getObjVal? "il" then
+    let i <- jNat idx
+    if let .ok a := j.getObjVal? "succ" then keep s!"{i} #US {<- jNat a}"
+    else if let .ok a := j.getObjVal? "max" then
+      match <- jNats a with
+      | [x, y] => keep s!"{i} #UM {x} {y}"
+      | _ => throw "legacy: malformed max level"
+    else if let .ok a := j.getObjVal? "imax" then
+      match <- jNats a with
+      | [x, y] => keep s!"{i} #UIM {x} {y}"
+      | _ => throw "legacy: malformed imax level"
+    else if let .ok a := j.getObjVal? "param" then keep s!"{i} #UP {<- jNat a}"
+    else throw "legacy: unrecognised level record"
+  else if let .ok idx := j.getObjVal? "ie" then
+    let i <- jNat idx
+    if let .ok a := j.getObjVal? "bvar" then keep s!"{i} #EV {<- jNat a}"
+    else if let .ok a := j.getObjVal? "sort" then keep s!"{i} #ES {<- jNat a}"
+    else if let .ok o := j.getObjVal? "const" then
+      keep s!"{i} #EC {<- jNat (<- o.getObjVal? "name")} {seqStr (<- jNats (<- o.getObjVal? "us"))}"
+    else if let .ok o := j.getObjVal? "app" then
+      keep s!"{i} #EA {<- jNat (<- o.getObjVal? "fn")} {<- jNat (<- o.getObjVal? "arg")}"
+    else if let .ok o := j.getObjVal? "lam" then
+      keep s!"{i} #EL {binderTag (<- binderIdx o)} {<- jNat (<- o.getObjVal? "name")} \
+{<- jNat (<- o.getObjVal? "type")} {<- jNat (<- o.getObjVal? "body")}"
+    else if let .ok o := j.getObjVal? "forallE" then
+      keep s!"{i} #EP {binderTag (<- binderIdx o)} {<- jNat (<- o.getObjVal? "name")} \
+{<- jNat (<- o.getObjVal? "type")} {<- jNat (<- o.getObjVal? "body")}"
+    else if let .ok o := j.getObjVal? "letE" then
+      keep s!"{i} #EZ {<- jNat (<- o.getObjVal? "name")} {<- jNat (<- o.getObjVal? "type")} \
+{<- jNat (<- o.getObjVal? "value")} {<- jNat (<- o.getObjVal? "body")}"
+    else if let .ok o := j.getObjVal? "proj" then
+      keep s!"{i} #EJ {<- jNat (<- o.getObjVal? "typeName")} {<- jNat (<- o.getObjVal? "idx")} \
+{<- jNat (<- o.getObjVal? "struct")}"
+    else if let .ok a := j.getObjVal? "natVal" then keep s!"{i} #ELN {<- jNat a}"
+    else if let .ok a := j.getObjVal? "strVal" then
+      keep s!"{i} #ELS {String.intercalate " " ((<- a.getStr?).toUTF8.toList.map hexByte)}"
+    else throw "legacy: unrecognised expression record"
+  -- Declarations carry no index.
+  else if let .ok o := j.getObjVal? "axiom" then
+    keep s!"#AX {<- jNat (<- o.getObjVal? "name")} {<- jNat (<- o.getObjVal? "type")} \
+{seqStr (<- jNats (<- o.getObjVal? "levelParams"))}"
+  else if let some o := valued j then
+    -- Definitions, theorems and opaques all become `#DEF`; the reference
+    -- exporter does the same, and the format has no other spelling for them.
+    keep s!"#DEF {<- jNat (<- o.getObjVal? "name")} {<- jNat (<- o.getObjVal? "type")} \
+{<- jNat (<- o.getObjVal? "value")} {seqStr (<- jNats (<- o.getObjVal? "levelParams"))}"
+  else if (j.getObjVal? "quot").isOk then
+    -- Lean 4 has four quotient constants; this format has one argument-less
+    -- record that declares the whole package, so emit it once.
+    if quotDone then return (none, true) else return (some "#QUOT", true)
+  else if let .ok o := j.getObjVal? "inductive" then
+    -- One record per type, as the reference exporter emits: it walks constants
+    -- one at a time, so a mutual block simply produces consecutive records.
+    let ctorArr <- (<- o.getObjVal? "ctors").getArr?
+    let mut ctorType : Std.HashMap Nat Nat := {}
+    for c in ctorArr do
+      ctorType := ctorType.insert (<- jNat (<- c.getObjVal? "name")) (<- jNat (<- c.getObjVal? "type"))
+    let mut out : Array String := #[]
+    for t in <- (<- o.getObjVal? "types").getArr? do
+      let ctors <- jNats (<- t.getObjVal? "ctors")
+      let intros <- ctors.flatMapM fun c => do
+        match ctorType[c]? with
+        | some ty => return [c, ty]
+        | none => throw s!"legacy: constructor {c} missing from its inductive block"
+      out := out.push s!"#IND {<- jNat (<- t.getObjVal? "numParams")} \
+{<- jNat (<- t.getObjVal? "name")} {<- jNat (<- t.getObjVal? "type")} {ctors.length} \
+{seqStr intros} {seqStr (<- jNats (<- t.getObjVal? "levelParams"))}"
+    return (some (String.intercalate "\n" out.toList), quotDone)
+  else throw "legacy: unrecognised record"
+where
+  /-- The body of whichever value-carrying declaration this record is. -/
+  valued (j : Json) : Option Json :=
+    ["def", "thm", "opaque"].findSome? fun k => (j.getObjVal? k).toOption
+
+  binderIdx (o : Json) : Except String Nat := do
+    match <- (<- o.getObjVal? "binderInfo").getStr? with
+    | "default" => return 0
+    | "implicit" => return 1
+    | "strictImplicit" => return 2
+    | "instImplicit" => return 3
+    | s => throw s!"legacy: unknown binder info {s}"
+
+/-- Render `roots` in the legacy line-based export format. -/
+def exportLegacy (env : Environment) (roots : Array Name) : Except String String := do
+  let recMap := recursorsByFamily env
+  let st := (roots.forM (emitConst env recMap)).run { } |>.2
+  let mut out : Array String := #[]
+  let mut quotDone := false
+  for line in st.lines do
+    let (rendered, q) <- legacyLine line quotDone
+    quotDone := q
+    if let some text := rendered then out := out.push text
+  return String.intercalate "\n" out.toList ++ "\n"
+
 end ZkLean
