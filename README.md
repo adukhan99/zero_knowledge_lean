@@ -226,7 +226,7 @@ zklean export ARTIFACT            re-emit for an independent checker
       --include M1,M2      also treat these modules as part of the sealed development
       --allow-axioms A,B   extra axioms `check` will tolerate
       --standalone         carry the whole closure; no Lean needed to check
-      --format F           `ndjson` (nanoda_lib, lean4lean) or `legacy` (zkPi)
+      --format F           `ndjson` (nanoda_lib) or `legacy` (zkPi)
 ```
 
 `check` exits 0 only if every artifact is `VALID`. `SRC DST` implies
@@ -387,6 +387,13 @@ soname as the toolchain's. Point the loader at the toolchain's own copy:
 ```console
 LD_LIBRARY_PATH="$(lake env printenv LEAN_SYSROOT)/lib" lake build
 ```
+
+## Contributing
+
+[CONTRIBUTING.md](CONTRIBUTING.md) covers the architecture, the four
+non-negotiables (the first being that a false `VALID` is the worst bug in the
+project), how to build the external checkers, where help would actually move
+things, and the Lean-4 internals that cost real debugging time here.
 
 ## Layout
 

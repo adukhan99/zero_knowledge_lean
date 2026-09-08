@@ -31,7 +31,7 @@ OPTIONS
       --standalone         carry the whole closure down to `Nat`, so the artifact
                            checks against an empty environment with no Lean install
       --format F           export format: `ndjson` (default, Lean v3.1.0, read by
-                           lean4lean / nanoda_lib) or `legacy` (the older
+                           nanoda_lib) or `legacy` (the older
                            line-based format, read by zkPi)
       --include M1,M2      also treat these modules as part of the sealed development
       --allow-axioms A,B   extra axioms `check` will tolerate (default: the three

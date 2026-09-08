@@ -7,7 +7,7 @@ The point of sealing is to end up with something an *independent* checker can
 verify. Writing a second Lean kernel is a bad idea -- a kernel that is only
 mostly right is an unsound verifier, which is worse than no verifier -- so
 instead we speak the format the existing ones already read
-(`lean4lean`, `nanoda_lib`, and anything built on them).
+(`nanoda_lib`, and anything built on the same formats).
 
 That is also the route to an actual zero-knowledge proof: the program a zkVM
 guest runs is one of those checkers, and its private input is this file. See
